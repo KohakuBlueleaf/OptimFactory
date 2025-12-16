@@ -13,7 +13,7 @@ from tqdm.auto import tqdm
 from optimfactory import (
     mup_param_group,
     mup_init,
-    mup_init_output,
+    mup_patch_output,
     muon_param_group_split,
     ComboOptimizer,
     ComboLRScheduler,
@@ -25,10 +25,11 @@ BATCH_SIZE = 256
 WORKERS = 4
 EMA_DECAY = 0.999
 
-BASE_LR = 1e-3
+BASE_LR = 5e-4
 BASE_DIM = 256
 WEIGHT_DECAY = 0.1
 USE_MUON = True
+USE_MUP = False
 
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
@@ -52,13 +53,24 @@ TRAIN_TRANSFORMS = trns.Compose(
 )
 
 
+class Permute(nn.Module):
+    def __init__(self, dims):
+        super(Permute, self).__init__()
+        self.dims = dims
+
+    def forward(self, x):
+        return x.permute(*self.dims)
+
+
 def block(in_ch, out_ch, mid_ch):
     return nn.Sequential(
         nn.GroupNorm(in_ch, in_ch),
         nn.Conv2d(in_ch, in_ch, 3, 1, 1, groups=in_ch),
-        nn.Conv2d(in_ch, mid_ch, 1),
+        Permute((0, 2, 3, 1)),
+        nn.Linear(in_ch, mid_ch),
         nn.Mish(),
-        nn.Conv2d(mid_ch, out_ch, 1),
+        nn.Linear(mid_ch, out_ch),
+        Permute((0, 3, 1, 2)),
     )
 
 
@@ -72,7 +84,7 @@ def mlp(in_ch, out_ch, mid_ch):
 
 
 class Net(nn.Module):
-    def __init__(self, num_classes=10, base_dim=32):
+    def __init__(self, num_classes=10, base_dim=32, use_mup=True):
         super(Net, self).__init__()
         self.in_proj = nn.Conv2d(1, base_dim, 3, 1, 1)
         self.block1 = block(base_dim, base_dim, base_dim * 4)  # 28x28
@@ -85,8 +97,9 @@ class Net(nn.Module):
         self.mlp2 = mlp(base_dim * 4, base_dim * 4, base_dim * 16)
         self.out_proj = nn.Linear(base_dim * 4, num_classes)
 
-        mup_init(self.parameters())
-        mup_init_output(self.out_proj.weight)
+        if use_mup:
+            mup_init(self.parameters())
+            mup_patch_output(self.out_proj)
 
     def forward(self, x):
         h = self.in_proj(x)
@@ -185,6 +198,7 @@ def main():
         shuffle=True,
         num_workers=WORKERS,
         drop_last=True,
+        persistent_workers=WORKERS > 0,
     )
     test_loader = DataLoader(
         MNIST(
@@ -195,18 +209,22 @@ def main():
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=WORKERS,
+        persistent_workers=WORKERS > 0,
     )
 
-    model = Net().to(device)
+    model = Net(use_mup=USE_MUP).to(device)
     print(sum(p.numel() for p in model.parameters()) / 1e6, "M params")
-    param_groups = mup_param_group(
-        model.parameters(),
-        base_lr=BASE_LR,
-        base_dim=BASE_DIM,
-        weight_decay=WEIGHT_DECAY,
-        weight_decay_scale=True,
-    )
-
+    if USE_MUP:
+        param_groups = mup_param_group(
+            model.parameters(),
+            base_lr=BASE_LR,
+            base_dim=BASE_DIM,
+            weight_decay=WEIGHT_DECAY,
+            weight_decay_scale=True,
+            input_module=model.in_proj,
+        )
+    else:
+        param_groups = model.parameters()
     lr_scheduler_config = {
         "lr": {
             "mode": "cosine",
@@ -220,9 +238,17 @@ def main():
         muon_group, adam_group = muon_param_group_split(param_groups, dim_threshold=16)
         optimizer = ComboOptimizer(
             [
-                optim.Muon(muon_group, lr=BASE_LR, weight_decay=WEIGHT_DECAY),
+                optim.Muon(
+                    muon_group,
+                    lr=BASE_LR,
+                    weight_decay=WEIGHT_DECAY,
+                    adjust_lr_fn="match_rms_adamw",  # This provide moonlight version scaling
+                ),
                 optim.AdamW(
-                    adam_group, lr=BASE_LR, betas=(0.9, 0.98), weight_decay=WEIGHT_DECAY
+                    adam_group,
+                    lr=BASE_LR,
+                    betas=(0.9, 0.98),
+                    weight_decay=WEIGHT_DECAY,
                 ),
             ]
         )
