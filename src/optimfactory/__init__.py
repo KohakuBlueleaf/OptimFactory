@@ -1,7 +1,13 @@
 """OptimFactory public API."""
 
 from .combo import ComboLRScheduler, ComboOptimizer
-from .initialization import mup_init, mup_init_output, mup_init_output
+from .initialization import (
+    mup_init,
+    mup_init_output,
+    mup_init_output,
+    mup_patch_output,
+    mup_unpatch,
+)
 from .param_group import muon_param_group_split, mup_param_group
 
 __all__ = [

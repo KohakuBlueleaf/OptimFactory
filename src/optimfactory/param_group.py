@@ -9,6 +9,7 @@ def mup_param_group(
     base_dim: int = 256,
     weight_decay: float = 1e-3,
     weight_decay_scale: bool = True,
+    input_module: torch.nn.Module | None = None,
 ) -> list[dict]:
     """Create µP-scaled parameter groups for optimizers.
 
@@ -29,10 +30,29 @@ def mup_param_group(
     Returns:
         List of optimizer parameter groups.
     """
+
     fan_in_groups = {}
+    input_groups = {}
+
+    if input_module is not None:
+        input_params = set(input_module.parameters())
+    else:
+        input_params = set()
+
     for param in params:
         ndim = param.ndim
         fan_in = get_fan_in(param)
+        if param in input_params:
+            if (fan_in, ndim) not in input_groups:
+                input_groups[(fan_in, ndim)] = {
+                    "params": [],
+                    "lr": base_lr,
+                    "weight_decay": weight_decay,
+                    "fan_in": fan_in,
+                    "ndim": ndim,
+                }
+            input_groups[(fan_in, ndim)]["params"].append(param)
+
         if ndim == 1:
             lr_scale = 1
         else:
@@ -52,8 +72,22 @@ def mup_param_group(
     return list(fan_in_groups.values())
 
 
+def moun_param_split(
+    params: list[torch.Tensor],
+    dim_threshold: int = 64,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    muon_params = []
+    adam_params = []
+    for param in params:
+        if param.ndim == 2 and get_fan_in(param) >= dim_threshold:
+            muon_params.append(param)
+        else:
+            adam_params.append(param)
+    return muon_params, adam_params
+
+
 def muon_param_group_split(
-    param_groups: list[dict[str, torch.Tensor | float]],
+    param_groups: list[dict[str, torch.Tensor | float]] | list[torch.Tensor],
     dim_threshold: int = 64,
 ) -> tuple[list[dict], list[dict]]:
     """Split param groups into (muon_group, adam_group).
@@ -69,6 +103,9 @@ def muon_param_group_split(
     Returns:
         Tuple of (muon_group, adam_group).
     """
+    param_groups = list(param_groups)
+    if isinstance(param_groups[0], torch.Tensor):
+        return moun_param_split(param_groups, dim_threshold)
     muon_group = []
     adam_group = []
     for group in param_groups:
