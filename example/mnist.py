@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import torch.optim.lr_scheduler as lr_sch
 from torch.utils.data import DataLoader
 from torchvision.datasets import MNIST
 from torchvision.transforms import transforms as trns
@@ -21,6 +20,8 @@ from optimfactory import (
 
 
 EPOCH = 20
+MODEL_CH = 16
+NORM_TYPE = "2d-layer"
 BATCH_SIZE = 256
 WORKERS = 4
 EMA_DECAY = 0.999
@@ -28,8 +29,8 @@ EMA_DECAY = 0.999
 BASE_LR = 5e-4
 BASE_DIM = 256
 WEIGHT_DECAY = 0.1
-USE_MUON = True
-USE_MUP = False
+USE_MUON = False
+USE_MUP = True
 
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
@@ -62,9 +63,27 @@ class Permute(nn.Module):
         return x.permute(*self.dims)
 
 
+def Norm2D(ch, type):
+    match type:
+        case ("group", groups):
+            if groups >= ch:
+                groups = ch
+            return nn.GroupNorm(groups, ch)
+        case "instance":
+            return nn.GroupNorm(ch, ch)
+        case "spatial-layer":
+            return nn.GroupNorm(1, ch)
+        case "2d-layer":
+            return nn.Sequential(
+                Permute((0, 2, 3, 1)),
+                nn.LayerNorm(ch),
+                Permute((0, 3, 1, 2)),
+            )
+
+
 def block(in_ch, out_ch, mid_ch):
     return nn.Sequential(
-        nn.GroupNorm(in_ch, in_ch),
+        Norm2D(in_ch, NORM_TYPE),
         nn.Conv2d(in_ch, in_ch, 3, 1, 1, groups=in_ch),
         Permute((0, 2, 3, 1)),
         nn.Linear(in_ch, mid_ch),
@@ -212,7 +231,7 @@ def main():
         persistent_workers=WORKERS > 0,
     )
 
-    model = Net(use_mup=USE_MUP).to(device)
+    model = Net(10, MODEL_CH, use_mup=USE_MUP).to(device)
     print(sum(p.numel() for p in model.parameters()) / 1e6, "M params")
     if USE_MUP:
         param_groups = mup_param_group(
