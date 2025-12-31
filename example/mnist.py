@@ -14,6 +14,7 @@ from optimfactory import (
     mup_init,
     mup_patch_output,
     muon_param_group_split,
+    compdp_param_group,
     ComboOptimizer,
     ComboLRScheduler,
 )
@@ -21,23 +22,34 @@ from optimfactory import (
 
 EPOCH = 20
 MODEL_CH = 16
-NORM_TYPE = "2d-layer"
+NORM_TYPE = "instance"
 BATCH_SIZE = 256
 WORKERS = 4
 EMA_DECAY = 0.999
 
-BASE_LR = 5e-4
 BASE_DIM = 256
-WEIGHT_DECAY = 0.1
-USE_MUON = False
-USE_MUP = True
+BASE_BS = 64
+BASE_DS = 1_000_000
+
+BASE_LR = 1e-3
+BASE_EPS = 1e-6
+BASE_WD = 0.1
+BASE_BETA1 = 0.9
+BASE_BETA2 = 0.99
+USE_MUON = True
+USE_MUP = False
+USE_COMDP = True
+
 
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
+    DTYPE = torch.float16
 elif torch.mps.is_available():
     DEVICE = torch.device("mps")
+    DTYPE = torch.float32
 else:
     DEVICE = torch.device("cpu")
+    DTYPE = torch.bfloat16
 TRANSFORMS = trns.Compose(
     [
         trns.ToTensor(),
@@ -153,7 +165,7 @@ def train(
         pbar := tqdm(enumerate(train_loader), total=len(train_loader))
     ):
         data, target = data.to(device), target.to(device)
-        with torch.autocast(device.type):
+        with torch.autocast(device.type, DTYPE):
             output = model(data)
             loss = F.cross_entropy(output, target)
         loss.backward()
@@ -184,7 +196,7 @@ def test(model: nn.Module, device: torch.device, test_loader: DataLoader, epoch:
     with torch.no_grad():
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
-            with torch.autocast(device.type):
+            with torch.autocast(device.type, DTYPE):
                 output = model(data)
                 test_loss += F.cross_entropy(
                     output, target, reduction="sum"
@@ -231,14 +243,33 @@ def main():
         persistent_workers=WORKERS > 0,
     )
 
-    model = Net(10, MODEL_CH, use_mup=USE_MUP).to(device)
+    datasize = len(train_loader.dataset) * EPOCH / BASE_DS
+    batchsize = BATCH_SIZE / BASE_BS
+
+    model = Net(10, MODEL_CH, use_mup=USE_MUP or USE_COMDP).to(device)
     print(sum(p.numel() for p in model.parameters()) / 1e6, "M params")
-    if USE_MUP:
+    if USE_COMDP:
+        param_groups = compdp_param_group(
+            model,
+            BASE_LR,
+            BASE_WD,
+            BASE_EPS,
+            BASE_BETA1,
+            BASE_BETA2,
+            BASE_DIM,
+            1,
+            1,
+            batchsize,
+            datasize,
+            input_module=model.in_proj,
+            output_module=model.out_proj,
+        )
+    elif USE_MUP:
         param_groups = mup_param_group(
             model.parameters(),
             base_lr=BASE_LR,
             base_dim=BASE_DIM,
-            weight_decay=WEIGHT_DECAY,
+            weight_decay=BASE_WD,
             weight_decay_scale=True,
             input_module=model.in_proj,
         )
@@ -260,14 +291,14 @@ def main():
                 optim.Muon(
                     muon_group,
                     lr=BASE_LR,
-                    weight_decay=WEIGHT_DECAY,
+                    weight_decay=BASE_WD,
                     adjust_lr_fn="match_rms_adamw",  # This provide moonlight version scaling
                 ),
                 optim.AdamW(
                     adam_group,
                     lr=BASE_LR,
-                    betas=(0.9, 0.98),
-                    weight_decay=WEIGHT_DECAY,
+                    betas=(BASE_BETA1, BASE_BETA2),
+                    weight_decay=BASE_WD,
                 ),
             ]
         )
@@ -281,8 +312,8 @@ def main():
         optimizer = optim.AdamW(
             param_groups,
             lr=BASE_LR,
-            betas=(0.9, 0.98),
-            weight_decay=WEIGHT_DECAY,
+            betas=(BASE_BETA1, BASE_BETA2),
+            weight_decay=BASE_WD,
         )
         lr_scheduler = AnySchedule(optimizer, config=lr_scheduler_config)
 
